@@ -1,7 +1,4 @@
-use std::{
-    fmt::Debug,
-    hash::{BuildHasher, Hash, Hasher, RandomState},
-};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 const DEFAULT_CAPACITY: usize = 1024;
 const EMPTY: u8 = 0x80;
@@ -12,6 +9,7 @@ pub struct Miso<K, V> {
     hash_builder: RandomState,
     capacity: usize,
     size: usize,
+    tombstones: usize,
 }
 
 impl<K, V> Miso<K, V> {
@@ -26,46 +24,48 @@ impl<K, V> Miso<K, V> {
 
 impl<K, V> Miso<K, V>
 where
-    K: Hash + Clone + Eq + Debug,
-    V: Clone + Debug,
+    K: Hash + Eq,
 {
     pub fn new() -> Self {
-        Miso {
-            items: vec![None; DEFAULT_CAPACITY],
-            hash_builder: RandomState::new(),
-            metadata: vec![EMPTY; DEFAULT_CAPACITY],
-            capacity: DEFAULT_CAPACITY,
-            size: 0,
-        }
+        Self::with_capacity(DEFAULT_CAPACITY)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.next_power_of_two();
+        let mut items = Vec::with_capacity(capacity);
+        items.resize_with(capacity, || None);
         Miso {
-            items: vec![None; capacity],
+            items,
             hash_builder: RandomState::new(),
             metadata: vec![EMPTY; capacity],
             capacity,
             size: 0,
+            tombstones: 0,
         }
     }
 
     pub fn insert(&mut self, key: K, value: V) {
+        self.maybe_grow();
         let mut hasher = self.hash_builder.build_hasher();
         key.hash(&mut hasher);
         let hash = hasher.finish();
         match self.probe_for_insert(hash, &key) {
             Some((index, new)) => {
+                let was_deleted = self.metadata[index] == DELETED;
                 self.items[index] = Some((key, value));
                 let hash_fingerprint = ((hash >> 57) & (0x7F)) as u8;
                 self.metadata[index] = hash_fingerprint;
                 if new {
                     self.size += 1;
                 }
+
+                if was_deleted {
+                    self.tombstones -= 1
+                }
             }
             None => {
-                // todo: resize?
-                panic!("table full!")
+                self.grow();
+                self.insert(key, value);
             }
         }
     }
@@ -184,11 +184,32 @@ where
                 let item = self.items[index].take().map(|(_, v)| v);
                 self.items[index] = None;
                 self.size -= 1;
+                self.tombstones += 1;
                 self.metadata[index] = DELETED;
                 return item;
             }
             None => None,
         }
+    }
+
+    fn maybe_grow(&mut self) {
+        let should_resize = (self.tombstones + self.size) * 8 >= self.capacity * 7;
+        if should_resize {
+            self.grow();
+        }
+    }
+
+    fn grow(&mut self) {
+        let mut new_map = Miso::with_capacity(2 * self.capacity);
+        new_map.hash_builder = self.hash_builder.clone();
+
+        for item in self.items.iter_mut() {
+            if let Some((k, v)) = item.take() {
+                new_map.insert(k, v);
+            }
+        }
+
+        *self = new_map
     }
 }
 
@@ -206,9 +227,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_full_table() {
+    fn test_resize() {
         let mut map = Miso::with_capacity(2);
+        let old_cap = map.capacity();
         let key1 = "key1";
         let value1 = "value1";
         let key2 = "key2";
@@ -219,8 +240,9 @@ mod tests {
         map.insert(key2, value2);
         map.insert(key3, value3);
         assert_eq!(map.get(&key1), Some(&value1));
-        assert_eq!(map.get(&key1), Some(&value1));
-        assert_eq!(map.get(&key1), Some(&value1));
+        assert_eq!(map.get(&key2), Some(&value2));
+        assert_eq!(map.get(&key3), Some(&value3));
+        assert!(map.capacity() > old_cap);
     }
 
     #[test]
