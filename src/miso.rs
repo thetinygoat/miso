@@ -1,16 +1,12 @@
 use std::{
-    fmt::{Debug, Display},
+    fmt::Debug,
     hash::{BuildHasher, Hash, Hasher, RandomState},
 };
 
 const DEFAULT_CAPACITY: usize = 1024;
 const EMPTY: u8 = 0x80;
 const DELETED: u8 = 0xFE;
-pub struct Miso<K, V>
-where
-    K: Hash + Clone + Debug + Display,
-    V: Clone + Debug,
-{
+pub struct Miso<K, V> {
     items: Vec<Option<(K, V)>>,
     metadata: Vec<u8>,
     hash_builder: RandomState,
@@ -18,9 +14,19 @@ where
     size: usize,
 }
 
+impl<K, V> Miso<K, V> {
+    pub fn size(&self) -> usize {
+        return self.size;
+    }
+
+    pub fn capacity(&self) -> usize {
+        return self.capacity;
+    }
+}
+
 impl<K, V> Miso<K, V>
 where
-    K: Hash + Clone + Eq + Debug + Display,
+    K: Hash + Clone + Eq + Debug,
     V: Clone + Debug,
 {
     pub fn new() -> Self {
@@ -168,6 +174,22 @@ where
             }
         }
     }
+
+    pub fn delete(&mut self, key: &K) -> Option<V> {
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        match self.probe_for_lookup(hash, &key) {
+            Some(index) => {
+                let item = self.items[index].take().map(|(_, v)| v);
+                self.items[index] = None;
+                self.size -= 1;
+                self.metadata[index] = DELETED;
+                return item;
+            }
+            None => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,15 +198,16 @@ mod tests {
     #[test]
     fn test_insert() {
         let mut map = Miso::new();
-        let key = String::from("key");
+        let key = "key";
         let value = "value";
-        map.insert(key.clone(), value);
+        map.insert(key, value);
         assert_eq!(map.get(&key), Some(&value));
+        assert_eq!(map.size(), 1);
     }
 
     #[test]
     #[should_panic]
-    fn test_panic() {
+    fn test_full_table() {
         let mut map = Miso::with_capacity(2);
         let key1 = "key1";
         let value1 = "value1";
@@ -198,5 +221,16 @@ mod tests {
         assert_eq!(map.get(&key1), Some(&value1));
         assert_eq!(map.get(&key1), Some(&value1));
         assert_eq!(map.get(&key1), Some(&value1));
+    }
+
+    #[test]
+    fn test_delete() {
+        let mut map = Miso::new();
+        let key = "key";
+        let value = "value";
+        map.insert(key, value);
+        map.delete(&key);
+        assert_eq!(map.get(&key), None);
+        assert_eq!(map.size(), 0);
     }
 }
