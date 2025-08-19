@@ -1,8 +1,15 @@
+use std::arch::aarch64::{
+    vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8,
+};
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
 const DEFAULT_CAPACITY: usize = 1024;
 const EMPTY: u8 = 0x80;
 const DELETED: u8 = 0xFE;
+
+const LOOKUP_TABLE: [u8; 16] = [
+    0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+];
 pub struct Miso<K, V> {
     items: Vec<Option<(K, V)>>,
     metadata: Vec<u8>,
@@ -84,6 +91,23 @@ where
         let mut index = ((hash) & (self.capacity - 1) as u64) as usize;
         let original_index = index;
         let mut reusable_index = None;
+        let mut i = 0;
+        while i < self.capacity {
+            let hash_fingerprint = ((hash >> 57) & 0x7F) as u8;
+            unsafe {
+                let metadata_group = vld1q_u8(self.metadata.as_ptr().add(index));
+                let hash_group = vdupq_n_u8(hash_fingerprint);
+
+                let matches = vceqq_u8(metadata_group, hash_group);
+                let lookup = vld1q_u8(LOOKUP_TABLE.as_ptr());
+                let masked = vandq_u8(matches, lookup);
+                let low = vaddv_u8(vget_low_u8(masked));
+                let high = vaddv_u8(vget_high_u8(masked));
+                let bitmask = low as u16 | ((high as u16) << 8);
+                println!("{:?}", bitmask);
+            }
+            i += 16
+        }
         loop {
             let control = self.metadata[index];
             if control == EMPTY {
@@ -254,5 +278,15 @@ mod tests {
         map.delete(&key);
         assert_eq!(map.get(&key), None);
         assert_eq!(map.size(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_hash() {
+        let mut map = Miso::new();
+        let key = "key";
+        let value1 = "value1";
+        let value2 = "value2";
+        map.insert(key, value1);
+        map.insert(key, value2);
     }
 }
