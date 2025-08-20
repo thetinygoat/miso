@@ -1,6 +1,6 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8,
+    uint8x16_t, vaddv_u8, vandq_u8, vceqq_u8, vdupq_n_u8, vget_high_u8, vget_low_u8, vld1q_u8,
 };
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 
@@ -91,7 +91,7 @@ where
     fn probe_for_insert(&self, hash: u64, key: &K) -> Option<(usize, bool)> {
         #[cfg(target_arch = "aarch64")]
         {
-            return self.probe_for_insert_aarch64(hash);
+            return self.probe_for_insert_aarch64(hash, key);
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -100,10 +100,12 @@ where
         }
     }
 
+    #[allow(dead_code)]
     fn probe_for_insert_default(&self, hash: u64, key: &K) -> Option<(usize, bool)> {
         let mut index = ((hash) & (self.capacity - 1) as u64) as usize;
         let original_index = index;
         let mut reusable_index = None;
+        let hash_fingerprint = ((hash >> 57) & 0x7F) as u8;
         loop {
             let control = self.metadata[index];
             if control == EMPTY {
@@ -132,7 +134,6 @@ where
 
             let stored_fingerprint = control & 0x7F;
             // extract the top 7 bits of the hash
-            let hash_fingerprint = ((hash >> 57) & 0x7F) as u8;
 
             // we might have a match, check the exact key
             if stored_fingerprint == hash_fingerprint {
@@ -156,29 +157,75 @@ where
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn probe_for_insert_aarch64(&self, hash: u64) -> Option<(usize, bool)> {
-        let mut index = ((hash) & (self.capacity - 1) as u64) as usize;
-        let original_index = index;
-        // let mut reusable_index = None;
-        let mut i = 0;
-        while i < self.capacity {
-            let hash_fingerprint = ((hash >> 57) & 0x7F) as u8;
-            unsafe {
-                let metadata_group = vld1q_u8(self.metadata.as_ptr().add(index));
-                let hash_group = vdupq_n_u8(hash_fingerprint);
+    fn probe_for_insert_aarch64(&self, hash: u64, key: &K) -> Option<(usize, bool)> {
+        unsafe {
+            let mut index = ((hash) & (self.capacity - 1) as u64) as usize;
+            let original_index = index;
+            let mut reusable_index = None;
+            let hash_fingerprint = vdupq_n_u8(((hash >> 57) & 0x7F) as u8);
+            loop {
+                // we cannot load 16 bytes into the simd register, fallback to scalar
+                if index + 16 >= self.capacity {
+                    return self.probe_for_insert_default(hash, key);
+                }
+                let metadata_vector = vld1q_u8(self.metadata.as_ptr().add(index));
+                let empty_mask = self.get_mask(vceqq_u8(metadata_vector, vdupq_n_u8(EMPTY)));
+                let mut delete_mask = self.get_mask(vceqq_u8(metadata_vector, vdupq_n_u8(DELETED)));
+                let mut hash_mask = self.get_mask(vceqq_u8(metadata_vector, hash_fingerprint));
 
-                let matches = vceqq_u8(metadata_group, hash_group);
-                let lookup = vld1q_u8(LOOKUP_TABLE.as_ptr());
-                let masked = vandq_u8(matches, lookup);
-                let low = vaddv_u8(vget_low_u8(masked));
-                let high = vaddv_u8(vget_high_u8(masked));
-                let bitmask = low as u16 | ((high as u16) << 8);
-                println!("{:?}", bitmask);
+                // process the 16 bits of the mask
+                while empty_mask != 0 || delete_mask != 0 || hash_mask != 0 {
+                    if empty_mask != 0 {
+                        let offset = empty_mask.trailing_zeros() as usize;
+                        return match reusable_index {
+                            Some(idx) => Some((idx, true)),
+                            None => Some((index + offset, true)),
+                        };
+                    }
+
+                    if reusable_index.is_none() && delete_mask != 0 {
+                        let offset = delete_mask.trailing_zeros() as usize;
+                        reusable_index = Some(index + offset);
+                        delete_mask &= delete_mask - 1;
+                    }
+
+                    if hash_mask != 0 {
+                        let offset = hash_mask.trailing_zeros() as usize;
+
+                        if let Some((k, _)) = &self.items[index + offset] {
+                            if *key == *k {
+                                return Some((index + offset, false));
+                            }
+                        }
+
+                        hash_mask &= hash_mask - 1;
+                    }
+                }
+
+                index = (index + 16) & (self.capacity - 1);
+                if index == original_index {
+                    return match reusable_index {
+                        Some(idx) => Some((idx, true)),
+                        None => None,
+                    };
+                }
             }
-            i += 16
         }
+    }
 
-        None
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn get_mask(&self, result: uint8x16_t) -> u16 {
+        unsafe {
+            // load the lookup table into 16 lanes
+            let lookup = vld1q_u8(LOOKUP_TABLE.as_ptr());
+            // AND the matches with the lookup table to set proper bits
+            let masked = vandq_u8(result, lookup);
+            // convert the high and low vectors to bits to a single u8 with proper bits set
+            let low = vaddv_u8(vget_low_u8(masked));
+            let high = vaddv_u8(vget_high_u8(masked));
+            // construct the final bitmask
+            low as u16 | ((high as u16) << 8)
+        }
     }
 
     fn probe_for_lookup(&self, hash: u64, key: &K) -> Option<usize> {
@@ -264,7 +311,7 @@ mod tests {
     use crate::miso::Miso;
     #[test]
     fn test_insert() {
-        let mut map = Miso::new();
+        let mut map = Miso::with_capacity(2);
         let key = "key";
         let value = "value";
         map.insert(key, value);
@@ -304,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_hash() {
-        let mut map = Miso::new();
+        let mut map = Miso::with_capacity(4);
         let key = "key";
         let value1 = "value1";
         let value2 = "value2";
