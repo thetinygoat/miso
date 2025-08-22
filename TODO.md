@@ -1,141 +1,83 @@
-# Swiss Table with AArch64 SIMD Implementation Plan
+# Production Readiness TODO — Miso (SwissTable)
 
-## Phase 1: Foundation & Infrastructure
+Notes
+- Each task is scoped to roughly 2–3 hours.
+- Prefer small, verifiable increments; run tests and benches after each cluster of changes.
+- Keep scalar baseline correct while adding SIMD; guard with feature flags.
 
-### 1. Setup ARM NEON Type Definitions
-- [ ] Add proper ARM NEON intrinsic imports (uint8x16_t, uint16x8_t, etc.)
-- [ ] Define constants for SIMD operations (GROUP_SIZE = 16)
-- [ ] Add target architecture guards (#[cfg(target_arch = "aarch64")])
-- [ ] Create fallback scalar implementation for non-AArch64 targets
+## Recommended Sequence
+1) Correctness & safety → 2) Group/scalar baseline → 3) SIMD → 4) Hashing/API → 5) Resize/tombstones → 6) Tests/benches → 7) CI/docs → 8) Release.
 
-### 2. Create SIMD Utility Functions
-- [ ] Implement `simd_match_byte()` - compare 16 bytes against target value
-- [ ] Implement `simd_to_bitmask()` - convert SIMD comparison result to u16 bitmask
-- [ ] Add `find_first_set_bit()` helper for bitmask processing
-- [ ] Create `is_aligned_16()` helper for checking memory alignment
+## 1. Correctness & Safety
+- [ ] Add invariant checks and asserts (power-of-two capacity, buffer lengths match, group alignment) [2h]
+- [ ] Refactor `insert` to loop-after-grow (remove recursion) [2h]
+- [ ] Audit all `unsafe` blocks; add “Safety:” docs; ensure reads/writes are strictly guarded by control byte state [2–3h]
+- [ ] Handle ZST keys/values explicitly; add unit tests for ZSTs [2h]
+- [ ] Panic-safety audit for `grow`/rehash paths; ensure no leaks/double-drops on early returns [2–3h]
 
-### 3. Refactor Metadata Layout
-- [ ] Ensure metadata vector is 16-byte aligned in memory
-- [ ] Add padding to capacity calculations to ensure alignment
-- [ ] Update `with_capacity()` to allocate aligned metadata
-- [ ] Add debug assertions for alignment verification
+## 2. Control-Byte Layout & Grouped Probing (Scalar Baseline)
+- [ ] Append sentinel tail to control bytes (len = capacity + 16; fill with 0xFF) [2h]
+- [ ] Ensure 16-byte alignment for control array; add debug assertions [2h]
+- [ ] Implement `Group` (scalar): load 16 control bytes; `match_fingerprint(h2)`, `match_empty()`, `match_deleted()` → u16 bitmasks [2–3h]
+- [ ] Rewrite `probe_for_lookup` to iterate by groups using bitmasks, early-exit on empty [2–3h]
+- [ ] Rewrite `probe_for_insert` to groups with first-tombstone tracking and early-exit on empty [2–3h]
 
-## Phase 2: Group-Based Probing Infrastructure
+## 3. SIMD Implementations
+- [ ] AArch64 NEON group ops behind `cfg(target_arch = "aarch64")` and a `simd` feature flag [2–3h]
+- [ ] Implement NEON movemask-equivalent (compare vs splat(h2), extract u16 mask) and validate vs scalar [2–3h]
+- [ ] Optional: x86_64 SSE2/SSSE3 path behind feature flag with movemask [2–3h]
+- [ ] Feature toggles and runtime fallback; tests ensure scalar/SIMD produce identical results [2h]
 
-### 4. Implement Group Structure
-- [ ] Create `Group` struct wrapping 16-byte metadata slice
-- [ ] Add `Group::load()` method with bounds checking
-- [ ] Implement `Group::match_fingerprint()` using SIMD
-- [ ] Add `Group::match_empty()` and `Group::match_deleted()` methods
+## 4. Hashing & API Generics
+- [ ] Generalize hasher: `Miso<K, V, S = RandomState> where S: BuildHasher` [2–3h]
+- [ ] Add constructors: `with_hasher`, `with_capacity_and_hasher` [2h]
+- [ ] Add optional `fast-hash` feature (e.g., `ahash`) for benchmarks; RandomState remains default [2h]
 
-### 5. Create Group Iterator
-- [ ] Implement `GroupIterator` that processes 16-byte chunks
-- [ ] Add bounds checking and scalar fallback for partial groups
-- [ ] Ensure proper wraparound handling for ring buffer behavior
-- [ ] Add early termination when full table is scanned
+## 5. Resizing & Tombstone Management
+- [ ] Extract growth policy constants; document 7/8 load-factor rationale [2h]
+- [ ] Add rehash-without-growth when tombstones exceed threshold (e.g., > size/2) [2–3h]
+- [ ] Implement `reserve(additional)` and `shrink_to_fit()`; verify invariants post-move [2–3h]
 
-### 6. Bitmask Processing Utilities
-- [ ] Implement `BitMask` wrapper for u16 with iteration methods
-- [ ] Add `first_set_bit()`, `clear_lowest_bit()` methods
-- [ ] Create `for_each_set_bit()` iterator for processing matches
-- [ ] Add debug formatting for bitmask visualization
+## 6. API Surface & Ergonomics
+- [ ] Rename `size()` → `len()`; keep `size()` as alias temporarily [2h]
+- [ ] Add `is_empty()`, `contains_key(&K)` [2h]
+- [ ] Add `get_mut(&K) -> Option<&mut V>`, `remove(&K)` (alias `delete`) [2h]
+- [ ] Implement `clear()` freeing/reinitializing control bytes safely [2h]
+- [ ] Minimal `entry()` API (Occupied/Vacant) for in-place updates/default inserts [2–3h]
+- [ ] Iterators: `iter()`, `iter_mut()`, `into_iter()`, plus `keys()`/`values()` [2–3h]
+- [ ] Derive/impl `Debug`, `Default`, `Clone`, `PartialEq` where K,V permit [2h]
 
-## Phase 3: SIMD-Enabled Core Operations
+## 7. Tests & Verification
+- [ ] Duplicate insert returns old value and keeps new stored [2h]
+- [ ] Tombstone reuse: delete then insert reuses slots; counts accurate [2h]
+- [ ] Wraparound clustering tests (near end-of-table) for probe termination correctness [2h]
+- [ ] Rehash tests: heavy delete then insert; validate contents and load factors [2–3h]
+- [ ] Collision-heavy custom hasher to stress equality and tombstones [2h]
+- [ ] Property tests with `proptest` against `HashMap` on random op sequences [2–3h]
+- [ ] Run under Miri; fix any UB; document unsafe invariants in code [2–3h]
 
-### 7. Rewrite `probe_for_insert()` with Group-Based Approach
-- [ ] Remove existing SIMD code and scalar loop separation
-- [ ] Implement group-by-group scanning with early termination
-- [ ] Add SIMD fingerprint matching with fallback to key comparison
-- [ ] Properly handle deleted slot reuse with SIMD detection
+## 8. Benchmarks & Profiling
+- [ ] Probe-length distribution benchmark; record average/worst-case probe counts [2h]
+- [ ] Group-based vs scalar insert/lookup benches (sequential and random keys) [2–3h]
+- [ ] Delete/tombstone-heavy workload benches; before/after rehash-without-growth [2h]
+- [ ] Feature matrix benches: RandomState vs `ahash`; SIMD on/off [2h]
 
-### 8. Update `probe_for_lookup()` with SIMD
-- [ ] Convert to group-based iteration
-- [ ] Use SIMD for empty slot detection (early exit)
-- [ ] Optimize fingerprint comparison path
-- [ ] Ensure consistent behavior with insert probe
+## 9. Tooling & CI
+- [ ] CI: `cargo clippy --all-targets --all-features`, `cargo fmt -- --check`, `RUSTFLAGS='-D warnings'` [2h]
+- [ ] Matrix: stable/beta/nightly; Linux/macOS; features (simd on/off, fast-hash on/off) [2–3h]
+- [ ] MSRV policy (e.g., 1.74+); enforce in CI and document [2–3h]
+- [ ] Optional: qemu-based aarch64 job to validate NEON builds/tests [2–3h]
 
-### 9. Optimize `delete()` Operation
-- [ ] Use SIMD probe for deletion target location
-- [ ] Ensure tombstone marking works with group-based approach
-- [ ] Verify deleted slot detection in subsequent operations
+## 10. Documentation & Examples
+- [ ] Crate-level docs: design overview (control bytes, groups, tombstones, grow policy) [2–3h]
+- [ ] “Safety” section documenting invariants per unsafe block/function [2h]
+- [ ] API examples: insert/get/remove, entry, reserve/shrink [2h]
+- [ ] Performance guide: load factors, reserving capacity, SIMD availability [2–3h]
+- [ ] README updates with feature flags, target support, benchmark snapshot [2h]
 
-## Phase 4: SIMD Bitmask Optimization (AArch64 Specific)
+## 11. Release & Maintenance
+- [ ] CHANGELOG and semantic versioning policy [2h]
+- [ ] Document default/optional features and stability [2h]
+- [ ] CONTRIBUTING: dev setup, test/bench/profiling workflow [2h]
+- [ ] Optional: `no_std + alloc` exploration behind feature gate [2–3h]
 
-### 10. Implement Efficient Bitmask Conversion
-- [ ] Research ARM NEON equivalent of `_mm_movemask_epi8`
-- [ ] Implement using `vshrn_n_u16` and `vmovn_u16` approach
-- [ ] Add alternative implementation using `vaddv` if needed
-- [ ] Benchmark different approaches for best performance
-
-### 11. Optimize Match Detection Pipeline
-- [ ] Minimize register pressure in SIMD operations
-- [ ] Use single SIMD load for multiple comparison types
-- [ ] Pipeline fingerprint and empty/deleted checks
-- [ ] Add prefetch hints for next group when beneficial
-
-### 12. Handle Edge Cases
-- [ ] Proper handling of table sizes not divisible by 16
-- [ ] Boundary checking for wraparound scenarios
-- [ ] Ensure alignment requirements don't break on resize
-- [ ] Add safety checks for debug builds
-
-## Phase 5: Testing & Validation
-
-### 13. Create Comprehensive Unit Tests
-- [ ] Test SIMD utilities in isolation
-- [ ] Verify group-based operations match scalar behavior
-- [ ] Add tests for edge cases (small tables, alignment issues)
-- [ ] Create property-based tests with random operations
-
-### 14. Add Integration Tests
-- [ ] Large-scale insertion/deletion cycles
-- [ ] Stress test with high load factors
-- [ ] Verify tombstone management under heavy delete patterns
-- [ ] Test resize behavior with SIMD-optimized operations
-
-### 15. Performance Benchmarks
-- [ ] Benchmark against std::collections::HashMap
-- [ ] Compare SIMD vs scalar performance on AArch64
-- [ ] Profile memory access patterns and cache behavior
-- [ ] Add benchmarks for different key/value types
-
-## Phase 6: Performance Optimization
-
-### 16. Memory Layout Optimizations
-- [ ] Experiment with interleaved vs separate metadata storage
-- [ ] Optimize data structure padding and alignment
-- [ ] Consider cache line alignment for metadata groups
-- [ ] Profile and optimize memory access patterns
-
-### 17. Algorithm Tuning
-- [ ] Optimize load factor thresholds for resize
-- [ ] Tune fingerprint extraction (currently top 7 bits)
-- [ ] Experiment with different probing strategies
-- [ ] Optimize tombstone cleanup frequency
-
-### 18. Advanced SIMD Optimizations
-- [ ] Investigate wider SIMD operations where applicable
-- [ ] Add vectorized hash computation if beneficial
-- [ ] Consider batch operations for multiple key lookups
-- [ ] Explore prefetching strategies for sequential access
-
-## Phase 7: Documentation & Polish
-
-### 19. Code Documentation
-- [ ] Add comprehensive rustdoc comments
-- [ ] Document SIMD implementation details and requirements
-- [ ] Create usage examples and best practices
-- [ ] Add performance characteristics documentation
-
-### 20. API Refinement
-- [ ] Ensure consistent error handling
-- [ ] Add Debug and Display implementations where needed
-- [ ] Consider additional convenience methods
-- [ ] Finalize public API surface
-
-## Notes:
-- Each task should be completable in 30-60 minutes
-- Run tests after each major change
-- Profile performance after each phase
-- Keep scalar fallback working throughout development
-- Focus on correctness first, then optimize for performance

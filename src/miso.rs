@@ -22,10 +22,12 @@ pub struct Miso<K, V> {
 }
 
 impl<K, V> Miso<K, V> {
-    pub fn size(&self) -> usize {
+    #[inline]
+    pub fn len(&self) -> usize {
         return self.size;
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         return self.capacity;
     }
@@ -43,10 +45,15 @@ where
         let capacity = capacity.max(16).next_power_of_two();
         let mut items = Vec::with_capacity(capacity);
         items.resize_with(capacity, || MaybeUninit::uninit());
+        let control_bytes = vec![ctrl_empty(); capacity];
+
+        debug_assert!(control_bytes.len() == capacity);
+        debug_assert!(items.len() == capacity);
+
         Miso {
             items,
             hash_builder: RandomState::new(),
-            control_bytes: vec![ctrl_empty(); capacity],
+            control_bytes,
             capacity,
             size: 0,
             tombstones: 0,
@@ -54,35 +61,37 @@ where
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.maybe_grow();
-        let (h1, h2) = self.get_h1_h2_from_key(&key);
-
-        match self.probe_for_insert(h1, h2, &key) {
-            Some(InsertProbe::Found(index)) => unsafe {
-                let (_, v) = self.items[index].assume_init_mut();
-                let old = mem::replace(v, value);
-                Some(old)
-            },
-            Some(InsertProbe::Vacant(index)) => {
-                if is_deleted(self.control_bytes[index]) {
-                    self.tombstones -= 1
+        loop {
+            self.maybe_grow_or_rehash();
+            let (h1, h2) = self.get_h1_h2_from_key(&key);
+            match self.probe_for_insert(h1, h2, &key) {
+                Some(InsertProbe::Found(index)) => unsafe {
+                    let (_, v) = self.items[index].assume_init_mut();
+                    let old = mem::replace(v, value);
+                    return Some(old);
+                },
+                Some(InsertProbe::Vacant(index)) => {
+                    if is_deleted(self.control_bytes[index]) {
+                        self.tombstones -= 1
+                    }
+                    self.items[index].write((key, value));
+                    self.control_bytes[index] = h2;
+                    self.size += 1;
+                    return None;
                 }
-                self.items[index].write((key, value));
-                self.control_bytes[index] = h2;
-                self.size += 1;
-                None
-            }
-            None => {
-                self.grow();
-                self.insert(key, value);
-                None
+                None => {
+                    // if we receieved None, that means there is no place for the new key to go
+                    // we just need to continue the loop and the maybe_grow_or_rehash fn
+                    // will take care of the rest
+                    continue;
+                }
             }
         }
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
         let (h1, h2) = self.get_h1_h2_from_key(&key);
-        match self.probe_for_lookup(h1, h2, &key) {
+        match self.probe_for_lookup_scalar(h1, h2, &key) {
             Some(index) => unsafe {
                 let (_, v) = self.items[index].assume_init_ref();
                 Some(v)
@@ -99,7 +108,7 @@ where
         let mut index = self.get_index_from_h1(h1);
         let mut first_tombstone = None;
         let start = index;
-
+        let mask = self.capacity() - 1;
         loop {
             let ctrl = self.control_bytes[index];
 
@@ -125,7 +134,7 @@ where
                 first_tombstone = Some(InsertProbe::Vacant(index))
             }
 
-            index = (index + 1) & (self.capacity - 1);
+            index = (index + 1) & mask;
 
             if index == start {
                 return None;
@@ -135,6 +144,7 @@ where
 
     #[inline]
     fn get_index_from_h1(&self, h1: u64) -> usize {
+        debug_assert!(self.capacity.is_power_of_two());
         (h1 as usize) & (self.capacity() - 1)
     }
 
@@ -148,10 +158,10 @@ where
         (h1, h2)
     }
 
-    fn probe_for_lookup(&self, h1: u64, h2: u8, key: &K) -> Option<usize> {
-        debug_assert!(self.capacity.is_power_of_two());
+    fn probe_for_lookup_scalar(&self, h1: u64, h2: u8, key: &K) -> Option<usize> {
         let mut index = self.get_index_from_h1(h1);
         let start = index;
+        let mask = self.capacity() - 1;
         loop {
             let ctrl = self.control_bytes[index];
 
@@ -170,7 +180,7 @@ where
             if is_empty(ctrl) {
                 return None;
             }
-            index = (index + 1) & (self.capacity - 1);
+            index = (index + 1) & mask;
             if index == start {
                 return None;
             }
@@ -179,7 +189,7 @@ where
 
     pub fn delete(&mut self, key: &K) -> Option<V> {
         let (h1, h2) = self.get_h1_h2_from_key(&key);
-        match self.probe_for_lookup(h1, h2, &key) {
+        match self.probe_for_lookup_scalar(h1, h2, &key) {
             Some(index) => unsafe {
                 let (_, v) = self.items[index].assume_init_read();
                 self.size -= 1;
@@ -191,15 +201,49 @@ where
         }
     }
 
-    fn maybe_grow(&mut self) {
-        let should_resize = (self.tombstones + self.size) * 8 >= self.capacity * 7;
-        if should_resize {
+    fn maybe_grow_or_rehash(&mut self) {
+        if self.should_rehash() {
+            self.rehash();
+        } else if self.should_grow() {
             self.grow();
         }
     }
 
+    #[inline]
+    fn should_rehash(&self) -> bool {
+        // if load factor is high, its better to grow than to rehash
+        let should_grow = (self.tombstones + self.size) >= self.capacity - (self.capacity >> 3);
+        let should_rehash = self.tombstones >= self.size >> 1;
+
+        return should_rehash && !should_grow;
+    }
+
+    #[inline]
+    fn should_grow(&self) -> bool {
+        return (self.tombstones + self.size) * 8 >= self.capacity * 7;
+    }
+
     fn grow(&mut self) {
         let mut new_map = Miso::with_capacity(2 * self.capacity);
+
+        new_map.hash_builder = self.hash_builder.clone();
+
+        for i in 0..self.capacity {
+            if is_full(self.control_bytes[i]) {
+                unsafe {
+                    let (k, v) = self.items[i].assume_init_read();
+                    self.control_bytes[i] = ctrl_deleted();
+                    new_map.insert(k, v);
+                }
+            }
+        }
+
+        *self = new_map
+    }
+
+    fn rehash(&mut self) {
+        let mut new_map = Miso::with_capacity(self.capacity());
+
         new_map.hash_builder = self.hash_builder.clone();
 
         for i in 0..self.capacity {
@@ -238,7 +282,7 @@ mod tests {
         let value = "value";
         map.insert(key, value);
         assert_eq!(map.get(&key), Some(&value));
-        assert_eq!(map.size(), 1);
+        assert_eq!(map.len(), 1);
     }
 
     #[test]
@@ -263,7 +307,7 @@ mod tests {
         map.insert(key, value);
         map.delete(&key);
         assert_eq!(map.get(&key), None);
-        assert_eq!(map.size(), 0);
+        assert_eq!(map.len(), 0);
     }
 
     #[test]
