@@ -9,4 +9,4 @@ This project is still in its early phases, the core functionality is correct. Fo
 - [x] Open adressing with linear probing
 - [x] Using control bytes while probing
 - [x] Base functionality and correctness
-- [] SIMD acceleration
+- [ ] SIMD acceleration
