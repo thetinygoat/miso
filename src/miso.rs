@@ -311,12 +311,106 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_hash() {
+    fn test_overwrite() {
         let mut map = Miso::with_capacity(4);
         let key = "key";
         let value1 = "value1";
         let value2 = "value2";
-        map.insert(key, value1);
-        map.insert(key, value2);
+        assert_eq!(map.insert(key, value1), None);
+        assert_eq!(map.insert(key, value2), Some(value1));
+        assert_eq!(map.get(&key), Some(&value2));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_missing() {
+        let mut map: Miso<&'static str, &'static str> = Miso::new();
+        assert_eq!(map.delete(&"nonexistent"), None);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_many_collisions() {
+        let mut map = Miso::with_capacity(16);
+        // Insert many keys to force collisions
+        for i in 0..100 {
+            let key = format!("collision_key_{}", i);
+            let value = format!("value_{}", i);
+            map.insert(key, value);
+        }
+        // Verify all are retrievable
+        for i in 0..100 {
+            let key = format!("collision_key_{}", i);
+            let value = format!("value_{}", i);
+            assert_eq!(map.get(&key), Some(&value));
+        }
+    }
+
+    #[test]
+    fn test_repeated_insert_delete() {
+        let mut map = Miso::with_capacity(16);
+
+        for cycle in 0..10 {
+            for i in 0..10 {
+                let key = format!("cycle{}_{}", cycle, i);
+                let value = format!("value{}_{}", cycle, i);
+                map.insert(key, value);
+            }
+
+            for i in 0..10 {
+                let key = format!("cycle{}_{}", cycle, i);
+                assert!(map.delete(&key).is_some());
+            }
+
+            assert_eq!(map.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_zst_key() {
+        let mut map = Miso::<(), i32>::new();
+        assert_eq!(map.insert((), 42), None);
+        assert_eq!(map.get(&()), Some(&42));
+        assert_eq!(map.insert((), 24), Some(42));
+        assert_eq!(map.get(&()), Some(&24));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_zst_value() {
+        let mut map = Miso::<i32, ()>::new();
+        assert_eq!(map.insert(1, ()), None);
+        assert_eq!(map.insert(2, ()), None);
+        assert_eq!(map.get(&1), Some(&()));
+        assert_eq!(map.get(&2), Some(&()));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_zst_both() {
+        let mut map = Miso::<(), ()>::new();
+        assert_eq!(map.insert((), ()), None);
+        assert_eq!(map.get(&()), Some(&()));
+        assert_eq!(map.insert((), ()), Some(()));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_operations() {
+        let mut map = Miso::<String, String>::new();
+        assert_eq!(map.get(&"nonexistent".to_string()), None);
+        assert_eq!(map.delete(&"nonexistent".to_string()), None);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_small_capacity() {
+        let mut map = Miso::with_capacity(1);
+        let capacity = map.capacity();
+        assert!(capacity.is_power_of_two()); // Should be a power of two
+        assert!(capacity >= 1); // Should be at least the requested capacity
+
+        map.insert("key", "value");
+        assert_eq!(map.get(&"key"), Some(&"value"));
     }
 }
