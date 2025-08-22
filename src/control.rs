@@ -31,3 +31,8 @@ pub fn ctrl_empty() -> u8 {
 pub fn ctrl_deleted() -> u8 {
     DELETED
 }
+
+#[inline]
+pub fn ctrl_sentinel() -> u8 {
+    SENTINEL
+}

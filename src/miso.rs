@@ -3,7 +3,9 @@ use std::{
     mem::{self, MaybeUninit},
 };
 
-use crate::control::{ctrl_deleted, ctrl_empty, ctrl_h2, is_deleted, is_empty, is_full};
+use crate::control::{
+    ctrl_deleted, ctrl_empty, ctrl_h2, ctrl_sentinel, is_deleted, is_empty, is_full,
+};
 
 const DEFAULT_CAPACITY: usize = 1024;
 
@@ -45,9 +47,14 @@ where
         let capacity = capacity.max(16).next_power_of_two();
         let mut items = Vec::with_capacity(capacity);
         items.resize_with(capacity, || MaybeUninit::uninit());
-        let control_bytes = vec![ctrl_empty(); capacity];
+        let mut control_bytes = vec![ctrl_empty(); capacity];
 
-        debug_assert!(control_bytes.len() == capacity);
+        // add sentinel + clone control bytes for SIMD wraparound
+        control_bytes.push(ctrl_sentinel());
+        control_bytes.extend_from_slice(&[ctrl_empty(); 15]);
+
+        debug_assert!(control_bytes.len() == capacity + 16);
+        debug_assert!(control_bytes[capacity] == ctrl_sentinel());
         debug_assert!(items.len() == capacity);
 
         Miso {
@@ -76,6 +83,10 @@ where
                     }
                     self.items[index].write((key, value));
                     self.control_bytes[index] = h2;
+                    if index < 15 {
+                        let clone_index = self.capacity + index + 1;
+                        self.control_bytes[clone_index] = h2;
+                    }
                     self.size += 1;
                     return None;
                 }
@@ -195,6 +206,10 @@ where
                 self.size -= 1;
                 self.tombstones += 1;
                 self.control_bytes[index] = ctrl_deleted();
+                if index < 15 {
+                    let clone_index = self.capacity + index + 1;
+                    self.control_bytes[clone_index] = ctrl_deleted();
+                }
                 return Some(v);
             },
             None => None,
