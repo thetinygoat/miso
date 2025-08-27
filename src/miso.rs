@@ -35,10 +35,73 @@ impl<K, V> Miso<K, V> {
     }
 }
 
+struct Group<'a> {
+    group_bytes: &'a [u8],
+}
+
+impl<'a> Group<'a> {
+    pub fn load(group_bytes: &'a [u8]) -> Self {
+        debug_assert!(group_bytes.len() == 16);
+        Group { group_bytes }
+    }
+
+    pub fn h2_mask(&self, h2: u8) -> u16 {
+        let mut mask = 0u16;
+
+        for i in 0..self.group_bytes.len() {
+            // if the ith h2 matches with the key h2
+            // set the ith bit of the mask
+            if is_full(self.group_bytes[i]) && ctrl_h2(self.group_bytes[i]) == h2 {
+                mask = mask | (1u16 << i)
+            }
+        }
+
+        return mask;
+    }
+
+    pub fn delete_mask(&self) -> u16 {
+        let mut mask = 0u16;
+
+        for i in 0..self.group_bytes.len() {
+            if self.group_bytes[i] == ctrl_deleted() {
+                mask = mask | (1u16 << i)
+            }
+        }
+
+        return mask;
+    }
+
+    pub fn empty_mask(&self) -> u16 {
+        let mut mask = 0u16;
+
+        for i in 0..self.group_bytes.len() {
+            if self.group_bytes[i] == ctrl_empty() {
+                mask = mask | (1u16 << i)
+            }
+        }
+
+        return mask;
+    }
+}
+
 impl<K, V> Miso<K, V>
 where
     K: Hash + Eq,
 {
+    #[inline]
+    fn window_pos_to_index(&self, window_start: usize, bitpos: usize, mask: usize) -> usize {
+        // Map a position inside a 16-byte control window back to the real bucket index.
+        // control_bytes layout: [0..capacity) | [sentinel at capacity] | [clones of 0..15 at capacity+1 .. capacity+15]
+        // For positions before `capacity`, raw index equals window_start + bitpos.
+        // For positions after `capacity` (i.e., into the clone area), we must skip over the sentinel,
+        // hence subtract 1 before applying the mask.
+        let raw = window_start + bitpos;
+        if raw < self.capacity {
+            raw
+        } else {
+            (raw - 1) & mask
+        }
+    }
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
@@ -121,34 +184,87 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let ctrl = self.control_bytes[index];
+            let group = Group::load(&self.control_bytes[index..(index + 16)]);
+            let mut h2_mask = group.h2_mask(h2);
+            let delete_mask = group.delete_mask();
+            let empty_mask = group.empty_mask();
 
-            if is_full(ctrl) {
-                if ctrl_h2(ctrl) == h2 {
-                    unsafe {
-                        let (k, _) = self.items[index].assume_init_ref();
-                        if *k == *key {
-                            return Some(InsertProbe::Found(index));
-                        }
+            // there are some h2 matches
+            while h2_mask != 0u16 {
+                // find the index of first match
+                let bitpos = h2_mask.trailing_zeros() as usize;
+                let idx = self.window_pos_to_index(index, bitpos, mask);
+                // Extra safety in debug/test builds: if metadata claims FULL, the slot must be init.
+                if cfg!(test) {
+                    if !is_full(self.control_bytes[idx]) {
+                        eprintln!(
+                            "inconsistent metadata: index={}, bitpos={}, idx={}, group_byte={:#X}, ctrl_idx={:#X}",
+                            index,
+                            bitpos,
+                            idx,
+                            self.control_bytes[index + bitpos],
+                            self.control_bytes[idx]
+                        );
+                        debug_assert!(is_full(self.control_bytes[idx]));
                     }
+                }
+                unsafe {
+                    // SAFETY: We only read initialized slots; control bytes say FULL.
+                    let (k, _) = self.items[idx].assume_init_ref();
+                    if k == key {
+                        return Some(InsertProbe::Found(idx));
+                    }
+                }
+
+                // clear the processed bit
+                h2_mask &= h2_mask - 1
+            }
+
+            if first_tombstone.is_none() {
+                if delete_mask != 0u16 {
+                    let bitpos = delete_mask.trailing_zeros() as usize;
+                    let idx = self.window_pos_to_index(index, bitpos, mask);
+                    first_tombstone = Some(InsertProbe::Vacant(idx))
                 }
             }
 
-            if is_empty(ctrl) {
+            if empty_mask != 0u16 {
                 if first_tombstone.is_some() {
                     return first_tombstone;
                 }
-                return Some(InsertProbe::Vacant(index));
+                let bitpos = empty_mask.trailing_zeros() as usize;
+                let idx = self.window_pos_to_index(index, bitpos, mask);
+                return Some(InsertProbe::Vacant(idx));
             }
 
-            if is_deleted(ctrl) && first_tombstone.is_none() {
-                first_tombstone = Some(InsertProbe::Vacant(index))
-            }
+            // let ctrl = self.control_bytes[index];
 
-            index = (index + 1) & mask;
+            // if is_full(ctrl) {
+            //     if ctrl_h2(ctrl) == h2 {
+            //         unsafe {
+            //             let (k, _) = self.items[index].assume_init_ref();
+            //             if k == key {
+            //                 return Some(InsertProbe::Found(index));
+            //             }
+            //         }
+            //     }
+            // }
+
+            // if is_empty(ctrl) {
+            //     if first_tombstone.is_some() {
+            //         return first_tombstone;
+            //     }
+            //     return Some(InsertProbe::Vacant(index));
+            // }
+
+            // if is_deleted(ctrl) && first_tombstone.is_none() {
+            //     first_tombstone = Some(InsertProbe::Vacant(index))
+            // }
+
+            index = (index + 16) & mask;
 
             if index == start {
-                return None;
+                return first_tombstone;
             }
         }
     }
@@ -174,24 +290,27 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let ctrl = self.control_bytes[index];
+            let group = Group::load(&self.control_bytes[index..(index + 16)]);
+            let mut h2_mask = group.h2_mask(h2);
+            let empty_mask = group.empty_mask();
 
-            if is_full(ctrl) {
-                let ctrl_h2 = ctrl_h2(ctrl);
-                if ctrl_h2 == h2 {
-                    unsafe {
-                        let (k, _) = &self.items[index].assume_init_ref();
-
-                        if *k == *key {
-                            return Some(index);
-                        }
+            // there are some h2 matches
+            while h2_mask != 0u16 {
+                let bitpos = h2_mask.trailing_zeros() as usize;
+                let idx = self.window_pos_to_index(index, bitpos, mask);
+                unsafe {
+                    let (k, _) = self.items[idx].assume_init_ref();
+                    if k == key {
+                        return Some(idx);
                     }
                 }
+                h2_mask &= h2_mask - 1
             }
-            if is_empty(ctrl) {
+
+            if empty_mask != 0u16 {
                 return None;
             }
-            index = (index + 1) & mask;
+            index = (index + 16) & mask;
             if index == start {
                 return None;
             }
