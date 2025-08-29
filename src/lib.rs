@@ -1,2 +1,5 @@
+mod bitmask;
 mod control;
-pub mod miso;
+mod group;
+mod scalar;
+pub mod table;

@@ -24,17 +24,17 @@ impl ControlByte {
     }
 
     #[inline]
-    pub fn is_empty(self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0 == Self::EMPTY
     }
 
     #[inline]
-    pub fn is_deleted(self) -> bool {
+    pub fn is_deleted(&self) -> bool {
         self.0 == Self::DELETED
     }
 
     #[inline]
-    pub fn tag(self) -> u8 {
+    pub fn tag(&self) -> u8 {
         return self.0 & 0x7F;
     }
 
@@ -50,7 +50,7 @@ impl ControlBytes {
         bytes[capacity] = ControlByte::SENTINEL_B;
 
         debug_assert!(bytes.len() == capacity + 16);
-        debug_assert!(bytes[capacity] == ControlByte::DELETED_B);
+        debug_assert!(bytes[capacity] == ControlByte::SENTINEL_B);
         ControlBytes {
             bytes: bytes.into_boxed_slice(),
             capacity,
@@ -58,13 +58,14 @@ impl ControlBytes {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     #[inline]
-    pub fn at(&self, idx: usize) -> ControlByte {
-        self.bytes[idx]
+    pub fn at(&self, idx: usize) -> &ControlByte {
+        &self.bytes[idx]
     }
 
     #[inline]
@@ -95,10 +96,28 @@ impl ControlBytes {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn set_empty(&mut self, idx: usize) {
         self.bytes[idx] = ControlByte::EMPTY_B;
         if let Some(clone_idx) = self.clone_idx(idx) {
             self.bytes[clone_idx] = self.bytes[idx];
         }
+    }
+
+    #[inline]
+    pub fn window(&self, idx: usize) -> &[ControlByte] {
+        return &self.bytes[idx..idx + 16];
+    }
+
+    #[inline]
+    pub fn table_idx(&self, start_idx: usize, bit_position: usize) -> usize {
+        let raw = start_idx + bit_position;
+
+        if raw < self.capacity {
+            return raw;
+        }
+
+        // subtract 1 becuase 1 slot is occupied by the sentinel
+        return (raw - 1) & (self.capacity - 1);
     }
 }

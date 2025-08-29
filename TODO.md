@@ -20,11 +20,11 @@ Notes
 
 ## 2. Control-Byte Layout & Grouped Probing (Scalar Baseline)
 
-- [ ] Append sentinel tail to control bytes (len = capacity + 16; fill with 0xFF) [2h]
-- [ ] Ensure 16-byte alignment for control array; add debug assertions [2h]
-- [ ] Implement `Group` (scalar): load 16 control bytes; `match_fingerprint(h2)`, `match_empty()`, `match_deleted()` → u16 bitmasks [2–3h]
-- [ ] Rewrite `probe_for_lookup` to iterate by groups using bitmasks, early-exit on empty [2–3h]
-- [ ] Rewrite `probe_for_insert` to groups with first-tombstone tracking and early-exit on empty [2–3h]
+- [x] Append sentinel tail to control bytes (len = capacity + 16; fill with 0xFF) [2h]
+- [x] Ensure 16-byte alignment for control array; add debug assertions [2h]
+- [x] Implement `Group` (scalar): load 16 control bytes; `match_fingerprint(h2)`, `match_empty()`, `match_deleted()` → u16 bitmasks [2–3h]
+- [x] Rewrite `probe_for_lookup` to iterate by groups using bitmasks, early-exit on empty [2–3h]
+- [x] Rewrite `probe_for_insert` to groups with first-tombstone tracking and early-exit on empty [2–3h]
 
 ## 3. SIMD Implementations
 
@@ -47,7 +47,7 @@ Notes
 
 ## 6. API Surface & Ergonomics
 
-- [ ] Rename `size()` → `len()`; keep `size()` as alias temporarily [2h]
+- [x] Rename `size()` → `len()`; keep `size()` as alias temporarily [2h]
 - [ ] Add `is_empty()`, `contains_key(&K)` [2h]
 - [ ] Add `get_mut(&K) -> Option<&mut V>`, `remove(&K)` (alias `delete`) [2h]
 - [ ] Implement `clear()` freeing/reinitializing control bytes safely [2h]
