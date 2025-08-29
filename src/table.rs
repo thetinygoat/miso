@@ -3,9 +3,7 @@ use std::{
     mem::{self, MaybeUninit},
 };
 
-use crate::control::{
-    ctrl_deleted, ctrl_empty, ctrl_h2, ctrl_sentinel, is_deleted, is_empty, is_full,
-};
+use crate::{control::ControlBytes, group::Group, scalar::ScalarGroup};
 
 const DEFAULT_CAPACITY: usize = 1024;
 
@@ -14,16 +12,16 @@ enum InsertProbe {
     Found(usize),
 }
 
-pub struct Miso<K, V> {
+pub struct HashMap<K, V> {
     items: Vec<MaybeUninit<(K, V)>>,
-    control_bytes: Vec<u8>,
+    ctrl_bytes: ControlBytes,
     hash_builder: RandomState,
     capacity: usize,
     size: usize,
     tombstones: usize,
 }
 
-impl<K, V> Miso<K, V> {
+impl<K, V> HashMap<K, V> {
     #[inline]
     pub fn len(&self) -> usize {
         return self.size;
@@ -35,73 +33,10 @@ impl<K, V> Miso<K, V> {
     }
 }
 
-struct Group<'a> {
-    group_bytes: &'a [u8],
-}
-
-impl<'a> Group<'a> {
-    pub fn load(group_bytes: &'a [u8]) -> Self {
-        debug_assert!(group_bytes.len() == 16);
-        Group { group_bytes }
-    }
-
-    pub fn h2_mask(&self, h2: u8) -> u16 {
-        let mut mask = 0u16;
-
-        for i in 0..self.group_bytes.len() {
-            // if the ith h2 matches with the key h2
-            // set the ith bit of the mask
-            if is_full(self.group_bytes[i]) && ctrl_h2(self.group_bytes[i]) == h2 {
-                mask = mask | (1u16 << i)
-            }
-        }
-
-        return mask;
-    }
-
-    pub fn delete_mask(&self) -> u16 {
-        let mut mask = 0u16;
-
-        for i in 0..self.group_bytes.len() {
-            if self.group_bytes[i] == ctrl_deleted() {
-                mask = mask | (1u16 << i)
-            }
-        }
-
-        return mask;
-    }
-
-    pub fn empty_mask(&self) -> u16 {
-        let mut mask = 0u16;
-
-        for i in 0..self.group_bytes.len() {
-            if self.group_bytes[i] == ctrl_empty() {
-                mask = mask | (1u16 << i)
-            }
-        }
-
-        return mask;
-    }
-}
-
-impl<K, V> Miso<K, V>
+impl<K, V> HashMap<K, V>
 where
     K: Hash + Eq,
 {
-    #[inline]
-    fn window_pos_to_index(&self, window_start: usize, bitpos: usize, mask: usize) -> usize {
-        // Map a position inside a 16-byte control window back to the real bucket index.
-        // control_bytes layout: [0..capacity) | [sentinel at capacity] | [clones of 0..15 at capacity+1 .. capacity+15]
-        // For positions before `capacity`, raw index equals window_start + bitpos.
-        // For positions after `capacity` (i.e., into the clone area), we must skip over the sentinel,
-        // hence subtract 1 before applying the mask.
-        let raw = window_start + bitpos;
-        if raw < self.capacity {
-            raw
-        } else {
-            (raw - 1) & mask
-        }
-    }
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_CAPACITY)
     }
@@ -110,20 +45,14 @@ where
         let capacity = capacity.max(16).next_power_of_two();
         let mut items = Vec::with_capacity(capacity);
         items.resize_with(capacity, || MaybeUninit::uninit());
-        let mut control_bytes = vec![ctrl_empty(); capacity];
+        let ctrl_bytes = ControlBytes::new(capacity);
 
-        // add sentinel + clone control bytes for SIMD wraparound
-        control_bytes.push(ctrl_sentinel());
-        control_bytes.extend_from_slice(&[ctrl_empty(); 15]);
-
-        debug_assert!(control_bytes.len() == capacity + 16);
-        debug_assert!(control_bytes[capacity] == ctrl_sentinel());
         debug_assert!(items.len() == capacity);
 
-        Miso {
+        HashMap {
             items,
             hash_builder: RandomState::new(),
-            control_bytes,
+            ctrl_bytes,
             capacity,
             size: 0,
             tombstones: 0,
@@ -141,15 +70,11 @@ where
                     return Some(old);
                 },
                 Some(InsertProbe::Vacant(index)) => {
-                    if is_deleted(self.control_bytes[index]) {
+                    if self.ctrl_bytes.at(index).is_deleted() {
                         self.tombstones -= 1
                     }
                     self.items[index].write((key, value));
-                    self.control_bytes[index] = h2;
-                    if index < 15 {
-                        let clone_index = self.capacity + index + 1;
-                        self.control_bytes[clone_index] = h2;
-                    }
+                    self.ctrl_bytes.set_full(index, h2);
                     self.size += 1;
                     return None;
                 }
@@ -184,82 +109,37 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let group = Group::load(&self.control_bytes[index..(index + 16)]);
-            let mut h2_mask = group.h2_mask(h2);
-            let delete_mask = group.delete_mask();
-            let empty_mask = group.empty_mask();
+            let group = Group::new(&self.ctrl_bytes.window(index));
+            let tag_mask = group.match_tag::<ScalarGroup>(h2);
+            let delete_mask = group.match_deleted::<ScalarGroup>();
+            let empty_mask = group.match_empty::<ScalarGroup>();
 
-            // there are some h2 matches
-            while h2_mask != 0u16 {
-                // find the index of first match
-                let bitpos = h2_mask.trailing_zeros() as usize;
-                let idx = self.window_pos_to_index(index, bitpos, mask);
-                // Extra safety in debug/test builds: if metadata claims FULL, the slot must be init.
-                if cfg!(test) {
-                    if !is_full(self.control_bytes[idx]) {
-                        eprintln!(
-                            "inconsistent metadata: index={}, bitpos={}, idx={}, group_byte={:#X}, ctrl_idx={:#X}",
-                            index,
-                            bitpos,
-                            idx,
-                            self.control_bytes[index + bitpos],
-                            self.control_bytes[idx]
-                        );
-                        debug_assert!(is_full(self.control_bytes[idx]));
+            if tag_mask.any() {
+                for hit in tag_mask {
+                    let index = self.ctrl_bytes.table_idx(index, hit);
+                    unsafe {
+                        let (k, _) = self.items[index].assume_init_ref();
+                        if k == key {
+                            return Some(InsertProbe::Found(index));
+                        }
                     }
                 }
-                unsafe {
-                    // SAFETY: We only read initialized slots; control bytes say FULL.
-                    let (k, _) = self.items[idx].assume_init_ref();
-                    if k == key {
-                        return Some(InsertProbe::Found(idx));
-                    }
-                }
-
-                // clear the processed bit
-                h2_mask &= h2_mask - 1
             }
 
             if first_tombstone.is_none() {
-                if delete_mask != 0u16 {
-                    let bitpos = delete_mask.trailing_zeros() as usize;
-                    let idx = self.window_pos_to_index(index, bitpos, mask);
-                    first_tombstone = Some(InsertProbe::Vacant(idx))
+                if delete_mask.any() {
+                    let index = self.ctrl_bytes.table_idx(index, delete_mask.lsb_idx());
+                    first_tombstone = Some(InsertProbe::Vacant(index))
                 }
             }
 
-            if empty_mask != 0u16 {
+            if empty_mask.any() {
                 if first_tombstone.is_some() {
                     return first_tombstone;
                 }
-                let bitpos = empty_mask.trailing_zeros() as usize;
-                let idx = self.window_pos_to_index(index, bitpos, mask);
-                return Some(InsertProbe::Vacant(idx));
+                let index = self.ctrl_bytes.table_idx(index, empty_mask.lsb_idx());
+                return Some(InsertProbe::Vacant(index));
             }
-
-            // let ctrl = self.control_bytes[index];
-
-            // if is_full(ctrl) {
-            //     if ctrl_h2(ctrl) == h2 {
-            //         unsafe {
-            //             let (k, _) = self.items[index].assume_init_ref();
-            //             if k == key {
-            //                 return Some(InsertProbe::Found(index));
-            //             }
-            //         }
-            //     }
-            // }
-
-            // if is_empty(ctrl) {
-            //     if first_tombstone.is_some() {
-            //         return first_tombstone;
-            //     }
-            //     return Some(InsertProbe::Vacant(index));
-            // }
-
-            // if is_deleted(ctrl) && first_tombstone.is_none() {
-            //     first_tombstone = Some(InsertProbe::Vacant(index))
-            // }
 
             index = (index + 16) & mask;
 
@@ -290,26 +170,26 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let group = Group::load(&self.control_bytes[index..(index + 16)]);
-            let mut h2_mask = group.h2_mask(h2);
-            let empty_mask = group.empty_mask();
+            let group = Group::new(&self.ctrl_bytes.window(index));
+            let tag_mask = group.match_tag::<ScalarGroup>(h2);
+            let empty_mask = group.match_empty::<ScalarGroup>();
 
-            // there are some h2 matches
-            while h2_mask != 0u16 {
-                let bitpos = h2_mask.trailing_zeros() as usize;
-                let idx = self.window_pos_to_index(index, bitpos, mask);
-                unsafe {
-                    let (k, _) = self.items[idx].assume_init_ref();
-                    if k == key {
-                        return Some(idx);
+            if tag_mask.any() {
+                for hit in tag_mask {
+                    let index = self.ctrl_bytes.table_idx(index, hit);
+                    unsafe {
+                        let (k, _) = self.items[index].assume_init_ref();
+                        if k == key {
+                            return Some(index);
+                        }
                     }
                 }
-                h2_mask &= h2_mask - 1
             }
 
-            if empty_mask != 0u16 {
+            if empty_mask.any() {
                 return None;
             }
+
             index = (index + 16) & mask;
             if index == start {
                 return None;
@@ -324,11 +204,7 @@ where
                 let (_, v) = self.items[index].assume_init_read();
                 self.size -= 1;
                 self.tombstones += 1;
-                self.control_bytes[index] = ctrl_deleted();
-                if index < 15 {
-                    let clone_index = self.capacity + index + 1;
-                    self.control_bytes[clone_index] = ctrl_deleted();
-                }
+                self.ctrl_bytes.set_deleted(index);
                 return Some(v);
             },
             None => None,
@@ -345,28 +221,31 @@ where
 
     #[inline]
     fn should_rehash(&self) -> bool {
-        // if load factor is high, its better to grow than to rehash
+        // Prefer grow over rehash when close to capacity
         let should_grow = (self.tombstones + self.size) >= self.capacity - (self.capacity >> 3);
-        let should_rehash = self.tombstones >= self.size >> 1;
+        // Only rehash when we actually have tombstones and they are at least half of live items
+        let should_rehash = self.tombstones > 0 && self.tombstones >= (self.size >> 1);
 
-        return should_rehash && !should_grow;
+        should_rehash && !should_grow
     }
 
     #[inline]
     fn should_grow(&self) -> bool {
-        return (self.tombstones + self.size) * 8 >= self.capacity * 7;
+        // Grow if the next insertion would push load factor beyond 7/8
+        (self.tombstones + self.size + 1) * 8 >= self.capacity * 7
     }
 
     fn grow(&mut self) {
-        let mut new_map = Miso::with_capacity(2 * self.capacity);
+        let mut new_map = HashMap::with_capacity(2 * self.capacity);
 
         new_map.hash_builder = self.hash_builder.clone();
 
         for i in 0..self.capacity {
-            if is_full(self.control_bytes[i]) {
+            if self.ctrl_bytes.at(i).is_full() {
                 unsafe {
                     let (k, v) = self.items[i].assume_init_read();
-                    self.control_bytes[i] = ctrl_deleted();
+                    // Mark as empty to avoid double-drop in our Drop impl
+                    self.ctrl_bytes.set_empty(i);
                     new_map.insert(k, v);
                 }
             }
@@ -376,15 +255,16 @@ where
     }
 
     fn rehash(&mut self) {
-        let mut new_map = Miso::with_capacity(self.capacity());
+        let mut new_map = HashMap::with_capacity(self.capacity());
 
         new_map.hash_builder = self.hash_builder.clone();
 
         for i in 0..self.capacity {
-            if is_full(self.control_bytes[i]) {
+            if self.ctrl_bytes.at(i).is_full() {
                 unsafe {
                     let (k, v) = self.items[i].assume_init_read();
-                    self.control_bytes[i] = ctrl_deleted();
+                    // Mark as empty to avoid double-drop in our Drop impl
+                    self.ctrl_bytes.set_empty(i);
                     new_map.insert(k, v);
                 }
             }
@@ -394,10 +274,10 @@ where
     }
 }
 
-impl<K, V> Drop for Miso<K, V> {
+impl<K, V> Drop for HashMap<K, V> {
     fn drop(&mut self) {
         for i in 0..self.capacity {
-            if is_full(self.control_bytes[i]) {
+            if self.ctrl_bytes.at(i).is_full() {
                 unsafe {
                     std::ptr::drop_in_place(self.items[i].as_mut_ptr());
                 }
@@ -408,10 +288,10 @@ impl<K, V> Drop for Miso<K, V> {
 
 #[cfg(test)]
 mod tests {
-    use crate::miso::Miso;
+    use crate::table::HashMap;
     #[test]
     fn test_insert() {
-        let mut map = Miso::with_capacity(2);
+        let mut map = HashMap::with_capacity(2);
         let key = "key";
         let value = "value";
         map.insert(key, value);
@@ -421,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_resize() {
-        let mut map = Miso::with_capacity(2);
+        let mut map = HashMap::with_capacity(2);
         let old_cap = map.capacity();
 
         // Insert just past the grow threshold: floor(7/8*cap) + 1
@@ -435,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let mut map = Miso::new();
+        let mut map = HashMap::new();
         let key = "key";
         let value = "value";
         map.insert(key, value);
@@ -446,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_overwrite() {
-        let mut map = Miso::with_capacity(4);
+        let mut map = HashMap::with_capacity(4);
         let key = "key";
         let value1 = "value1";
         let value2 = "value2";
@@ -458,14 +338,14 @@ mod tests {
 
     #[test]
     fn test_delete_missing() {
-        let mut map: Miso<&'static str, &'static str> = Miso::new();
+        let mut map: HashMap<&'static str, &'static str> = HashMap::new();
         assert_eq!(map.delete(&"nonexistent"), None);
         assert_eq!(map.len(), 0);
     }
 
     #[test]
     fn test_many_collisions() {
-        let mut map = Miso::with_capacity(16);
+        let mut map = HashMap::with_capacity(16);
         // Insert many keys to force collisions
         for i in 0..100 {
             let key = format!("collision_key_{}", i);
@@ -482,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_repeated_insert_delete() {
-        let mut map = Miso::with_capacity(16);
+        let mut map = HashMap::with_capacity(16);
 
         for cycle in 0..10 {
             for i in 0..10 {
@@ -502,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_zst_key() {
-        let mut map = Miso::<(), i32>::new();
+        let mut map = HashMap::<(), i32>::new();
         assert_eq!(map.insert((), 42), None);
         assert_eq!(map.get(&()), Some(&42));
         assert_eq!(map.insert((), 24), Some(42));
@@ -512,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_zst_value() {
-        let mut map = Miso::<i32, ()>::new();
+        let mut map = HashMap::<i32, ()>::new();
         assert_eq!(map.insert(1, ()), None);
         assert_eq!(map.insert(2, ()), None);
         assert_eq!(map.get(&1), Some(&()));
@@ -522,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_zst_both() {
-        let mut map = Miso::<(), ()>::new();
+        let mut map = HashMap::<(), ()>::new();
         assert_eq!(map.insert((), ()), None);
         assert_eq!(map.get(&()), Some(&()));
         assert_eq!(map.insert((), ()), Some(()));
@@ -531,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_empty_operations() {
-        let mut map = Miso::<String, String>::new();
+        let mut map = HashMap::<String, String>::new();
         assert_eq!(map.get(&"nonexistent".to_string()), None);
         assert_eq!(map.delete(&"nonexistent".to_string()), None);
         assert_eq!(map.len(), 0);
@@ -539,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_small_capacity() {
-        let mut map = Miso::with_capacity(1);
+        let mut map = HashMap::with_capacity(1);
         let capacity = map.capacity();
         assert!(capacity.is_power_of_two()); // Should be a power of two
         assert!(capacity >= 1); // Should be at least the requested capacity
