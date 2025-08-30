@@ -15,22 +15,13 @@ impl BitMask {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn pop_lsb(&mut self) -> usize {
-        let idx = self.lsb_idx();
-        self.0 &= self.0 - 1;
-        idx
-    }
-
-    #[inline]
     pub fn set(&mut self, i: usize) {
         self.0 |= 1 << i;
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn raw(self) -> u16 {
-        self.0
+    pub fn from_u16(mask: u16) -> BitMask {
+        BitMask(mask)
     }
 }
 
