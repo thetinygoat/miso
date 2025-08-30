@@ -28,10 +28,10 @@ Notes
 
 ## 3. SIMD Implementations
 
-- [ ] AArch64 NEON group ops behind `cfg(target_arch = "aarch64")` and a `simd` feature flag [2–3h]
-- [ ] Implement NEON movemask-equivalent (compare vs splat(h2), extract u16 mask) and validate vs scalar [2–3h]
+- [x] AArch64 NEON group ops behind `cfg(target_arch = "aarch64")` and a `simd` feature flag [2–3h]
+- [x] Implement NEON movemask-equivalent (compare vs splat(h2), extract u16 mask) and validate vs scalar [2–3h]
 - [ ] Optional: x86_64 SSE2/SSSE3 path behind feature flag with movemask [2–3h]
-- [ ] Feature toggles and runtime fallback; tests ensure scalar/SIMD produce identical results [2h]
+- [x] Feature toggles and runtime fallback; tests ensure scalar/SIMD produce identical results [2h]
 
 ## 4. Hashing & API Generics
 
