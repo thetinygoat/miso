@@ -3,7 +3,31 @@ use std::{
     mem::{self, MaybeUninit},
 };
 
-use crate::{control::ControlBytes, group::Group, scalar::ScalarGroup};
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon")
+)))]
+use crate::scalar::ScalarGroup;
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon")
+))]
+use crate::neon::NeonGroup;
+
+use crate::{control::ControlBytes, group::Group};
+
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon")
+))]
+type DefaultGroup = NeonGroup;
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "arm", target_feature = "neon")
+)))]
+type DefaultGroup = ScalarGroup;
 
 const DEFAULT_CAPACITY: usize = 1024;
 
@@ -90,7 +114,7 @@ where
 
     pub fn get(&self, key: &K) -> Option<&V> {
         let (h1, h2) = self.get_h1_h2_from_key(&key);
-        match self.probe_for_lookup_scalar(h1, h2, &key) {
+        match self.probe_for_lookup(h1, h2, &key) {
             Some(index) => unsafe {
                 let (_, v) = self.items[index].assume_init_ref();
                 Some(v)
@@ -100,19 +124,15 @@ where
     }
 
     fn probe_for_insert(&self, h1: u64, h2: u8, key: &K) -> Option<InsertProbe> {
-        return self.probe_for_insert_scalar(h1, h2, key);
-    }
-
-    fn probe_for_insert_scalar(&self, h1: u64, h2: u8, key: &K) -> Option<InsertProbe> {
         let mut index = self.get_index_from_h1(h1);
         let mut first_tombstone = None;
         let start = index;
         let mask = self.capacity() - 1;
         loop {
             let group = Group::new(&self.ctrl_bytes.window(index));
-            let tag_mask = group.match_tag::<ScalarGroup>(h2);
-            let delete_mask = group.match_deleted::<ScalarGroup>();
-            let empty_mask = group.match_empty::<ScalarGroup>();
+            let tag_mask = group.match_tag::<DefaultGroup>(h2);
+            let delete_mask = group.match_deleted::<DefaultGroup>();
+            let empty_mask = group.match_empty::<DefaultGroup>();
 
             if tag_mask.any() {
                 for hit in tag_mask {
@@ -165,14 +185,14 @@ where
         (h1, h2)
     }
 
-    fn probe_for_lookup_scalar(&self, h1: u64, h2: u8, key: &K) -> Option<usize> {
+    fn probe_for_lookup(&self, h1: u64, h2: u8, key: &K) -> Option<usize> {
         let mut index = self.get_index_from_h1(h1);
         let start = index;
         let mask = self.capacity() - 1;
         loop {
             let group = Group::new(&self.ctrl_bytes.window(index));
-            let tag_mask = group.match_tag::<ScalarGroup>(h2);
-            let empty_mask = group.match_empty::<ScalarGroup>();
+            let tag_mask = group.match_tag::<DefaultGroup>(h2);
+            let empty_mask = group.match_empty::<DefaultGroup>();
 
             if tag_mask.any() {
                 for hit in tag_mask {
@@ -199,7 +219,7 @@ where
 
     pub fn delete(&mut self, key: &K) -> Option<V> {
         let (h1, h2) = self.get_h1_h2_from_key(&key);
-        match self.probe_for_lookup_scalar(h1, h2, &key) {
+        match self.probe_for_lookup(h1, h2, &key) {
             Some(index) => unsafe {
                 let (_, v) = self.items[index].assume_init_read();
                 self.size -= 1;
