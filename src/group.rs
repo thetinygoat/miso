@@ -1,33 +1,37 @@
 use crate::{bitmask::BitMask, control::ControlByte};
 
 pub trait GroupOps {
-    fn match_tag(bytes: &[ControlByte; 16], tag: u8) -> BitMask;
-    fn match_deleted(bytes: &[ControlByte; 16]) -> BitMask;
-    fn match_empty(bytes: &[ControlByte; 16]) -> BitMask;
+    type View: Copy;
+    fn load(ptr: *const ControlByte) -> Self::View;
+    fn match_tag(view: Self::View, tag: u8) -> BitMask;
+    fn match_deleted(view: Self::View) -> BitMask;
+    fn match_empty(view: Self::View) -> BitMask;
 }
 
-pub struct Group<'a> {
-    bytes: &'a [ControlByte; 16],
+pub struct Group<G: GroupOps> {
+    view: G::View,
 }
 
-impl<'a> Group<'a> {
-    pub fn new(bytes: &'a [ControlByte]) -> Self {
+impl<G: GroupOps> Group<G> {
+    #[inline(always)]
+    pub fn load(ptr: *const ControlByte) -> Self {
         // unwrap is fine here becuase if it ever breaks
         // there is something wrong with our invariants
-        Group {
-            bytes: bytes.try_into().unwrap(),
-        }
+        Group { view: G::load(ptr) }
     }
 
-    pub fn match_tag<G: GroupOps>(&self, tag: u8) -> BitMask {
-        G::match_tag(self.bytes, tag)
+    #[inline(always)]
+    pub fn match_tag(&self, tag: u8) -> BitMask {
+        G::match_tag(self.view, tag)
     }
 
-    pub fn match_deleted<G: GroupOps>(&self) -> BitMask {
-        G::match_deleted(self.bytes)
+    #[inline(always)]
+    pub fn match_deleted(&self) -> BitMask {
+        G::match_deleted(self.view)
     }
 
-    pub fn match_empty<G: GroupOps>(&self) -> BitMask {
-        G::match_empty(self.bytes)
+    #[inline(always)]
+    pub fn match_empty(&self) -> BitMask {
+        G::match_empty(self.view)
     }
 }

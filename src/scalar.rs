@@ -1,13 +1,24 @@
 use crate::{bitmask::BitMask, control::ControlByte, group::GroupOps};
 
-pub struct ScalarGroup;
+pub struct ScalarOps;
 
-impl GroupOps for ScalarGroup {
-    fn match_tag(bytes: &[ControlByte; 16], tag: u8) -> BitMask {
+impl GroupOps for ScalarOps {
+    type View = [u8; 16];
+    #[inline(always)]
+    fn load(ptr: *const ControlByte) -> Self::View {
+        let p = ptr as *const u8;
+        let mut buf = [0u8; 16];
+        unsafe {
+            std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr(), 16);
+            buf
+        }
+    }
+    #[inline(always)]
+    fn match_tag(view: Self::View, tag: u8) -> BitMask {
         let mut mask = BitMask::ZERO;
 
         for i in 0..16 {
-            let byte = &bytes[i];
+            let byte = ControlByte::from(view[i]);
             if byte.is_full() {
                 if byte.tag() == tag {
                     mask.set(i);
@@ -18,11 +29,12 @@ impl GroupOps for ScalarGroup {
         mask
     }
 
-    fn match_deleted(bytes: &[ControlByte; 16]) -> BitMask {
+    #[inline(always)]
+    fn match_deleted(view: Self::View) -> BitMask {
         let mut mask = BitMask::ZERO;
 
         for i in 0..16 {
-            if bytes[i].is_deleted() {
+            if ControlByte::from(view[i]).is_deleted() {
                 mask.set(i);
             }
         }
@@ -30,11 +42,12 @@ impl GroupOps for ScalarGroup {
         mask
     }
 
-    fn match_empty(bytes: &[ControlByte; 16]) -> BitMask {
+    #[inline(always)]
+    fn match_empty(view: Self::View) -> BitMask {
         let mut mask = BitMask::ZERO;
 
         for i in 0..16 {
-            if bytes[i].is_empty() {
+            if ControlByte::from(view[i]).is_empty() {
                 mask.set(i);
             }
         }

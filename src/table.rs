@@ -7,13 +7,13 @@ use std::{
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon")
 )))]
-use crate::scalar::ScalarGroup;
+use crate::scalar::ScalarOps;
 
 #[cfg(any(
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon")
 ))]
-use crate::neon::NeonGroup;
+use crate::neon::NeonOps;
 
 use crate::{control::ControlBytes, group::Group};
 
@@ -21,13 +21,13 @@ use crate::{control::ControlBytes, group::Group};
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon")
 ))]
-type DefaultGroup = NeonGroup;
+type DefaultOps = NeonOps;
 
 #[cfg(not(any(
     target_arch = "aarch64",
     all(target_arch = "arm", target_feature = "neon")
 )))]
-type DefaultGroup = ScalarGroup;
+type DefaultOps = ScalarOps;
 
 const DEFAULT_CAPACITY: usize = 1024;
 
@@ -89,7 +89,7 @@ where
             let (h1, h2) = self.get_h1_h2_from_key(&key);
             match self.probe_for_insert(h1, h2, &key) {
                 Some(InsertProbe::Found(index)) => unsafe {
-                    let (_, v) = self.items[index].assume_init_mut();
+                    let (_, v) = self.items.get_unchecked_mut(index).assume_init_mut();
                     let old = mem::replace(v, value);
                     return Some(old);
                 },
@@ -97,7 +97,9 @@ where
                     if self.ctrl_bytes.at(index).is_deleted() {
                         self.tombstones -= 1
                     }
-                    self.items[index].write((key, value));
+                    unsafe {
+                        self.items.get_unchecked_mut(index).write((key, value));
+                    }
                     self.ctrl_bytes.set_full(index, h2);
                     self.size += 1;
                     return None;
@@ -116,7 +118,7 @@ where
         let (h1, h2) = self.get_h1_h2_from_key(&key);
         match self.probe_for_lookup(h1, h2, &key) {
             Some(index) => unsafe {
-                let (_, v) = self.items[index].assume_init_ref();
+                let (_, v) = self.items.get_unchecked(index).assume_init_ref();
                 Some(v)
             },
             None => None,
@@ -129,13 +131,13 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let group = Group::new(&self.ctrl_bytes.window(index));
-            let tag_mask = group.match_tag::<DefaultGroup>(h2);
-            let delete_mask = group.match_deleted::<DefaultGroup>();
-            let empty_mask = group.match_empty::<DefaultGroup>();
+            let group = Group::<DefaultOps>::load(self.ctrl_bytes.ptr_at(index));
+            let mut tag_mask = group.match_tag(h2);
+            let delete_mask = group.match_deleted();
+            let empty_mask = group.match_empty();
 
             if tag_mask.any() {
-                for hit in tag_mask {
+                while let Some(hit) = tag_mask.pop_lsb() {
                     let index = self.ctrl_bytes.table_idx(index, hit);
                     unsafe {
                         let (k, _) = self.items[index].assume_init_ref();
@@ -190,15 +192,15 @@ where
         let start = index;
         let mask = self.capacity() - 1;
         loop {
-            let group = Group::new(&self.ctrl_bytes.window(index));
-            let tag_mask = group.match_tag::<DefaultGroup>(h2);
-            let empty_mask = group.match_empty::<DefaultGroup>();
+            let group = Group::<DefaultOps>::load(self.ctrl_bytes.ptr_at(index));
+            let mut tag_mask = group.match_tag(h2);
+            let empty_mask = group.match_empty();
 
             if tag_mask.any() {
-                for hit in tag_mask {
+                while let Some(hit) = tag_mask.pop_lsb() {
                     let index = self.ctrl_bytes.table_idx(index, hit);
                     unsafe {
-                        let (k, _) = self.items[index].assume_init_ref();
+                        let (k, _) = self.items.get_unchecked(index).assume_init_ref();
                         if k == key {
                             return Some(index);
                         }
@@ -221,7 +223,7 @@ where
         let (h1, h2) = self.get_h1_h2_from_key(&key);
         match self.probe_for_lookup(h1, h2, &key) {
             Some(index) => unsafe {
-                let (_, v) = self.items[index].assume_init_read();
+                let (_, v) = self.items.get_unchecked(index).assume_init_read();
                 self.size -= 1;
                 self.tombstones += 1;
                 self.ctrl_bytes.set_deleted(index);
@@ -263,7 +265,7 @@ where
         for i in 0..self.capacity {
             if self.ctrl_bytes.at(i).is_full() {
                 unsafe {
-                    let (k, v) = self.items[i].assume_init_read();
+                    let (k, v) = self.items.get_unchecked(i).assume_init_read();
                     // Mark as empty to avoid double-drop in our Drop impl
                     self.ctrl_bytes.set_empty(i);
                     new_map.insert(k, v);
@@ -282,7 +284,7 @@ where
         for i in 0..self.capacity {
             if self.ctrl_bytes.at(i).is_full() {
                 unsafe {
-                    let (k, v) = self.items[i].assume_init_read();
+                    let (k, v) = self.items.get_unchecked(i).assume_init_read();
                     // Mark as empty to avoid double-drop in our Drop impl
                     self.ctrl_bytes.set_empty(i);
                     new_map.insert(k, v);
