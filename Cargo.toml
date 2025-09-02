@@ -12,3 +12,10 @@ rand = "0.9.2"
 [[bench]]
 name = "hashmap_workloads"
 harness = false
+
+[profile.bench]
+opt-level = 3            # maximum optimization
+lto = "thin"             # ThinLTO: good speed/compile-time tradeoff
+codegen-units = 1        # better cross-module inlining
+debug = false            # no debug symbols (smaller, slightly faster)
+debug-assertions = false # remove runtime debug checks
